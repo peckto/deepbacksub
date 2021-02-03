@@ -69,7 +69,7 @@ cv::Mat getTensorMat(int tnum, int debug) {
 	TfLiteIntArray* dims = interpreter->tensor(tnum)->dims;
 	if (debug) for (int i = 0; i < dims->size; i++) printf("tensor #%d: %d\n",tnum,dims->data[i]);
 	TFLITE_MINIMAL_CHECK(dims->data[0] == 1);
-	
+
 	int h = dims->data[1];
 	int w = dims->data[2];
 	int c = dims->data[3];
@@ -82,6 +82,9 @@ cv::Mat getTensorMat(int tnum, int debug) {
 
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
+// label number of "person" for DeepLab v3+ model
+const int cnum = labels.size();
+const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
 
 // threaded capture shared state
 typedef struct {
@@ -91,6 +94,24 @@ typedef struct {
 	int64 cnt;
 	pthread_mutex_t lock;
 } capinfo_t;
+
+typedef struct {
+	const char *modelname;
+	int threads;
+	int width;
+	int height;
+	int debug;
+	std::unique_ptr<tflite::FlatBufferModel> model;
+	cv::Mat input;
+	cv::Mat output;
+	cv::Rect roidim;
+	cv::Mat mask;
+	cv::Mat mroi;
+	cv::Mat raw;
+	cv::Mat ofinal;
+	cv::Mat element;
+	float ratio;
+} calcinfo_t;
 
 // capture thread function
 void *grab_thread(void *arg) {
@@ -108,6 +129,111 @@ void *grab_thread(void *arg) {
 		pthread_mutex_unlock(&ci->lock);
 	}
 	return NULL;
+}
+
+void init_tensorflow(calcinfo_t *info) {
+	// Load model
+	info->model = tflite::FlatBufferModel::BuildFromFile(info->modelname);
+	TFLITE_MINIMAL_CHECK(info->model != nullptr);
+
+	// Build the interpreter
+	tflite::ops::builtin::BuiltinOpResolver resolver;
+	// custom op for Google Meet network
+	resolver.AddCustom("Convolution2DTransposeBias", mediapipe::tflite_operations::RegisterConvolution2DTransposeBias());
+	InterpreterBuilder builder(*info->model, resolver);
+	builder(&interpreter);
+	TFLITE_MINIMAL_CHECK(interpreter != nullptr);
+
+	// Allocate tensor buffers.
+	TFLITE_MINIMAL_CHECK(interpreter->AllocateTensors() == kTfLiteOk);
+
+	// set interpreter params
+	interpreter->SetNumThreads(info->threads);
+	interpreter->SetAllowFp16PrecisionForFp32(true);
+
+	// get input and output tensor as cv::Mat
+	info->input = getTensorMat(interpreter->inputs ()[0],info->debug);
+	info->output = getTensorMat(interpreter->outputs()[0],info->debug);
+	info->ratio = (float)info->input.cols/(float) info->input.rows;
+
+	// initialize mask and square ROI in center
+	info->roidim = cv::Rect((info->width-info->height/info->ratio)/2,0,info->height/info->ratio,info->height);
+	info->mask = cv::Mat::ones(info->height,info->width,CV_8UC1);
+	info->mroi = info->mask(info->roidim);
+
+	// erosion/dilation element
+	info->element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size(5,5) );
+
+	// create Mat for small mask
+	info->ofinal = cv::Mat(info->output.rows,info->output.cols,CV_8UC1);
+}
+
+void calc_mask(calcinfo_t *info) {
+	// map ROI
+	cv::Mat roi = info->raw(info->roidim);
+
+	// resize ROI to input size
+	cv::Mat in_u8_yuv, in_u8_rgb;
+	cv::resize(roi,in_u8_yuv,cv::Size(info->input.cols,info->input.rows));
+	cv::cvtColor(in_u8_yuv,in_u8_rgb,CV_YUV2RGB_YUYV);
+	// TODO: can convert directly to float?
+
+	// convert to float and normalize values to [-1;1]
+	in_u8_rgb.convertTo(info->input,CV_32FC3,1.0/128.0,-1.0);
+
+	// Run inference
+	TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
+
+	float* tmp = (float*)info->output.data;
+	uint8_t* out = (uint8_t*)info->ofinal.data;
+
+	// find class with maximum probability
+	if (strstr(info->modelname,"deeplab"))
+	for (unsigned int n = 0; n < info->output.total(); n++) {
+		float maxval = -10000; int maxpos = 0;
+		for (int i = 0; i < cnum; i++) {
+			if (tmp[n*cnum+i] > maxval) {
+				maxval = tmp[n*cnum+i];
+				maxpos = i;
+			}
+		}
+		// set mask to 0 where class == person
+		uint8_t val = (maxpos==pers ? 0 : 255);
+		out[n] = (val & 0xE0) | (out[n] >> 3);
+	}
+
+	// threshold probability
+	if (strstr(info->modelname,"body-pix"))
+	for (unsigned int n = 0; n < info->output.total(); n++) {
+		// FIXME: hardcoded threshold
+		uint8_t val = (tmp[n] > 0.65 ? 0 : 255);
+		out[n] = (val & 0xE0) | (out[n] >> 3);
+	}
+
+	// Google Meet segmentation network
+	if (strstr(info->modelname,"segm_"))
+		/* 256 x 144 x 2 tensor for the full model or 160 x 96 x 2
+		 * tensor for the light model with masks for background
+		 * (channel 0) and person (channel 1) where values are in
+		 * range [MIN_FLOAT, MAX_FLOAT] and user has to apply
+		 * softmax across both channels to yield foreground
+		 * probability in [0.0, 1.0]. */
+	for (unsigned int n = 0; n < info->output.total(); n++) {
+		float exp0 = expf(tmp[2*n  ]);
+		float exp1 = expf(tmp[2*n+1]);
+		float p0 = exp0 / (exp0+exp1);
+		float p1 = exp1 / (exp0+exp1);
+		uint8_t val = (p0 < p1 ? 0 : 255);
+		out[n] = (val & 0xE0) | (out[n] >> 3);
+	}
+
+	// denoise
+	cv::Mat tmpbuf;
+	cv::dilate(info->ofinal,tmpbuf,info->element);
+	cv::erode(tmpbuf,info->ofinal,info->element);
+
+	// scale up into full-sized mask
+	cv::resize(info->ofinal,info->mroi,cv::Size(info->raw.rows/info->ratio,info->raw.rows));
 }
 
 int main(int argc, char* argv[]) {
@@ -244,46 +370,6 @@ int main(int argc, char* argv[]) {
 	cap.set(CV_CAP_PROP_FOURCC, *((uint32_t*)"YUYV"));
 	cap.set(CV_CAP_PROP_CONVERT_RGB, false);
 
-	// Load model
-	std::unique_ptr<tflite::FlatBufferModel> model =
-		tflite::FlatBufferModel::BuildFromFile(modelname);
-	TFLITE_MINIMAL_CHECK(model != nullptr);
-
-	// Build the interpreter
-	tflite::ops::builtin::BuiltinOpResolver resolver;
-	// custom op for Google Meet network
-	resolver.AddCustom("Convolution2DTransposeBias", mediapipe::tflite_operations::RegisterConvolution2DTransposeBias());
-	InterpreterBuilder builder(*model, resolver);
-	builder(&interpreter);
-	TFLITE_MINIMAL_CHECK(interpreter != nullptr);
-
-	// Allocate tensor buffers.
-	TFLITE_MINIMAL_CHECK(interpreter->AllocateTensors() == kTfLiteOk);
-
-	// set interpreter params
-	interpreter->SetNumThreads(threads);
-	interpreter->SetAllowFp16PrecisionForFp32(true);
-
-	// get input and output tensor as cv::Mat
-	cv::Mat  input = getTensorMat(interpreter->inputs ()[0],debug);
- 	cv::Mat output = getTensorMat(interpreter->outputs()[0],debug);
-	float ratio = (float)input.cols/(float) input.rows;
-
-	// initialize mask and square ROI in center
-	cv::Rect roidim = cv::Rect((width-height/ratio)/2,0,height/ratio,height);
-	cv::Mat mask = cv::Mat::ones(height,width,CV_8UC1);
-	cv::Mat mroi = mask(roidim);
-
-	// erosion/dilation element
-	cv::Mat element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size(5,5) );
-
-	// create Mat for small mask
-	cv::Mat ofinal(output.rows,output.cols,CV_8UC1);
-
-	// label number of "person" for DeepLab v3+ model
-	const int cnum = labels.size();
-	const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
-
 	// kick off separate grabber thread to keep OpenCV/FFMpeg happy (or it lags badly)
 	pthread_t grabber;
 	cv::Mat buf1;
@@ -294,6 +380,9 @@ int main(int argc, char* argv[]) {
 		perror("creating grabber thread");
 		exit(1);
 	}
+
+	calcinfo_t calcinfo = { modelname, threads, width, height, debug };
+	init_tensorflow(&calcinfo);
 
 	// mainloop
 	while (true) {
@@ -310,93 +399,30 @@ int main(int argc, char* argv[]) {
 		capinfo.raw = tmat;
 		pthread_mutex_unlock(&capinfo.lock);
 		// we can now guarantee capinfo.raw will remain unchanged while we process it..
-		cv::Mat raw = (*capinfo.raw);
-		if (raw.rows == 0 || raw.cols == 0) continue; // sanity check
+		calcinfo.raw = (*capinfo.raw);
+		if (calcinfo.raw.rows == 0 || calcinfo.raw.cols == 0) continue; // sanity check
 
-		// map ROI
-		cv::Mat roi = raw(roidim);
-
-		// resize ROI to input size
-		cv::Mat in_u8_yuv, in_u8_rgb;
-		cv::resize(roi,in_u8_yuv,cv::Size(input.cols,input.rows));
-		cv::cvtColor(in_u8_yuv,in_u8_rgb,CV_YUV2RGB_YUYV);
-		// TODO: can convert directly to float?
-
-		// convert to float and normalize values to [-1;1]
-		in_u8_rgb.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
-
-		// Run inference
-		TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
-
-		float* tmp = (float*)output.data;
-		uint8_t* out = (uint8_t*)ofinal.data;
-
-		// find class with maximum probability
-		if (strstr(modelname,"deeplab"))
-		for (unsigned int n = 0; n < output.total(); n++) {
-			float maxval = -10000; int maxpos = 0;
-			for (int i = 0; i < cnum; i++) {
-				if (tmp[n*cnum+i] > maxval) {
-					maxval = tmp[n*cnum+i];
-					maxpos = i;
-				}
-			}
-			// set mask to 0 where class == person
-			uint8_t val = (maxpos==pers ? 0 : 255);
-			out[n] = (val & 0xE0) | (out[n] >> 3);
-		}
-
-		// threshold probability
-		if (strstr(modelname,"body-pix"))
-		for (unsigned int n = 0; n < output.total(); n++) {
-			// FIXME: hardcoded threshold
-			uint8_t val = (tmp[n] > 0.65 ? 0 : 255);
-			out[n] = (val & 0xE0) | (out[n] >> 3);
-		}
-
-		// Google Meet segmentation network
-		if (strstr(modelname,"segm_"))
-			/* 256 x 144 x 2 tensor for the full model or 160 x 96 x 2
-			 * tensor for the light model with masks for background
-			 * (channel 0) and person (channel 1) where values are in
-			 * range [MIN_FLOAT, MAX_FLOAT] and user has to apply
-			 * softmax across both channels to yield foreground
-			 * probability in [0.0, 1.0]. */
-		for (unsigned int n = 0; n < output.total(); n++) {
-			float exp0 = expf(tmp[2*n  ]);
-			float exp1 = expf(tmp[2*n+1]);
-			float p0 = exp0 / (exp0+exp1);
-			float p1 = exp1 / (exp0+exp1);
-			uint8_t val = (p0 < p1 ? 0 : 255);
-			out[n] = (val & 0xE0) | (out[n] >> 3);
-		}
-
-		// denoise
-		cv::Mat tmpbuf;
-		cv::dilate(ofinal,tmpbuf,element);
-		cv::erode(tmpbuf,ofinal,element);
-
-		// scale up into full-sized mask
-		cv::resize(ofinal,mroi,cv::Size(raw.rows/ratio,raw.rows));
+		// do background detection magic
+		calc_mask(&calcinfo);
 
 		// copy background over raw cam image using mask
-		bg.copyTo(raw,mask);
+		bg.copyTo(calcinfo.raw,calcinfo.mask);
 
 		if (flipHorizontal) {
 			//Horizontal mirror destroys color in YUYV, need to detour via RGB
 			cv::Mat rgb;
-			cv::cvtColor(raw,rgb,CV_YUV2BGR_YUYV);
+			cv::cvtColor(calcinfo.raw,rgb,CV_YUV2BGR_YUYV);
 			cv::flip(rgb,rgb,1);
-			raw = convert_rgb_to_yuyv(rgb);
+			calcinfo.raw = convert_rgb_to_yuyv(rgb);
 		}
 		if (flipVertical) {
-			cv::flip(raw,raw,0);
+			cv::flip(calcinfo.raw,calcinfo.raw,0);
 		}
 
 		// write frame to v4l2loopback
-		int framesize = raw.step[0]*raw.rows;
+		int framesize = calcinfo.raw.step[0]*calcinfo.raw.rows;
 		while (framesize > 0) {
-			int ret = write(lbfd,raw.data,framesize);
+			int ret = write(lbfd,calcinfo.raw.data,framesize);
 			TFLITE_MINIMAL_CHECK(ret > 0);
 			framesize -= ret;
 		}
@@ -410,7 +436,7 @@ int main(int argc, char* argv[]) {
 		if (debug < 2) continue;
 
 		cv::Mat test;
-		cv::cvtColor(raw,test,CV_YUV2BGR_YUYV);
+		cv::cvtColor(calcinfo.raw,test,CV_YUV2BGR_YUYV);
 		cv::imshow("output.png",test);
 		if (cv::waitKey(1) == 'q') break;
 	}
