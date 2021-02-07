@@ -83,8 +83,8 @@ cv::Mat getTensorMat(int tnum, int debug) {
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
 // label number of "person" for DeepLab v3+ model
-const int cnum = labels.size();
-const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
+const size_t cnum = labels.size();
+const size_t pers = std::distance(std::find(labels.begin(),labels.end(),"person"), labels.begin());
 
 // threaded capture shared state
 typedef struct {
@@ -97,9 +97,9 @@ typedef struct {
 
 typedef struct {
 	const char *modelname;
-	int threads;
-	int width;
-	int height;
+	size_t threads;
+	size_t width;
+	size_t height;
 	int debug;
 	std::unique_ptr<tflite::FlatBufferModel> model;
 	cv::Mat input;
@@ -188,43 +188,46 @@ void calc_mask(calcinfo_t *info) {
 	uint8_t* out = (uint8_t*)info->ofinal.data;
 
 	// find class with maximum probability
-	if (strstr(info->modelname,"deeplab"))
-	for (unsigned int n = 0; n < info->output.total(); n++) {
-		float maxval = -10000; int maxpos = 0;
-		for (int i = 0; i < cnum; i++) {
-			if (tmp[n*cnum+i] > maxval) {
-				maxval = tmp[n*cnum+i];
-				maxpos = i;
-			}
-		}
-		// set mask to 0 where class == person
-		uint8_t val = (maxpos==pers ? 0 : 255);
-		out[n] = (val & 0xE0) | (out[n] >> 3);
+	if (strstr(info->modelname,"deeplab")) {
+	    for (unsigned int n = 0; n < info->output.total(); n++) {
+		   float maxval = -10000; size_t maxpos = 0;
+		   for (size_t i = 0; i < cnum; i++) {
+			  if (tmp[n*cnum+i] > maxval) {
+				 maxval = tmp[n*cnum+i];
+				 maxpos = i;
+			  }
+		   }
+		   // set mask to 0 where class == person
+		   uint8_t val = (maxpos==pers ? 0 : 255);
+		   out[n] = (val & 0xE0) | (out[n] >> 3);
+	    }
 	}
 
 	// threshold probability
-	if (strstr(info->modelname,"body-pix"))
-	for (unsigned int n = 0; n < info->output.total(); n++) {
-		// FIXME: hardcoded threshold
-		uint8_t val = (tmp[n] > 0.65 ? 0 : 255);
-		out[n] = (val & 0xE0) | (out[n] >> 3);
+	if (strstr(info->modelname,"body-pix")) {
+	    for (unsigned int n = 0; n < info->output.total(); n++) {
+		   // FIXME: hardcoded threshold
+		   uint8_t val = (tmp[n] > 0.65 ? 0 : 255);
+		   out[n] = (val & 0xE0) | (out[n] >> 3);
+	    }
 	}
 
 	// Google Meet segmentation network
-	if (strstr(info->modelname,"segm_"))
-		/* 256 x 144 x 2 tensor for the full model or 160 x 96 x 2
+	if (strstr(info->modelname,"segm_")) {
+	    /* 256 x 144 x 2 tensor for the full model or 160 x 96 x 2
 		 * tensor for the light model with masks for background
 		 * (channel 0) and person (channel 1) where values are in
 		 * range [MIN_FLOAT, MAX_FLOAT] and user has to apply
 		 * softmax across both channels to yield foreground
 		 * probability in [0.0, 1.0]. */
-	for (unsigned int n = 0; n < info->output.total(); n++) {
-		float exp0 = expf(tmp[2*n  ]);
-		float exp1 = expf(tmp[2*n+1]);
-		float p0 = exp0 / (exp0+exp1);
-		float p1 = exp1 / (exp0+exp1);
-		uint8_t val = (p0 < p1 ? 0 : 255);
-		out[n] = (val & 0xE0) | (out[n] >> 3);
+	    for (unsigned int n = 0; n < info->output.total(); n++) {
+		   float exp0 = expf(tmp[2*n  ]);
+		   float exp1 = expf(tmp[2*n+1]);
+		   float p0 = exp0 / (exp0+exp1);
+		   float p1 = exp1 / (exp0+exp1);
+		   uint8_t val = (p0 < p1 ? 0 : 255);
+		   out[n] = (val & 0xE0) | (out[n] >> 3);
+	    }
 	}
 
 	// denoise
@@ -243,9 +246,9 @@ int main(int argc, char* argv[]) {
 	printf("https://github.com/floe/deepbacksub\n");
 
 	int debug  = 0;
-	int threads= 2;
-	int width  = 640;
-	int height = 480;
+	size_t threads= 2;
+	size_t width  = 640;
+	size_t height = 480;
 	const char *back = nullptr; // "images/background.png";
 	const char *vcam = "/dev/video0";
 	const char *ccam = "/dev/video1";
@@ -290,7 +293,7 @@ int main(int argc, char* argv[]) {
 				showUsage = true;
 			}
 		} else if (strncmp(argv[arg], "-w", 2)==0) {
-			if (hasArgument && sscanf(argv[++arg], "%d", &width)) {
+			if (hasArgument && sscanf(argv[++arg], "%ld", &width)) {
 				if (!width) {
 					showUsage = true;
 				}
@@ -298,7 +301,7 @@ int main(int argc, char* argv[]) {
 				showUsage = true;
 			}
 		} else if (strncmp(argv[arg], "-h", 2)==0) {
-			if (hasArgument && sscanf(argv[++arg], "%d", &height)) {
+			if (hasArgument && sscanf(argv[++arg], "%ld", &height)) {
 				if (!height) {
 					showUsage = true;
 				}
@@ -306,7 +309,7 @@ int main(int argc, char* argv[]) {
 				showUsage = true;
 			}
 		} else if (strncmp(argv[arg], "-t", 2)==0) {
-			if (hasArgument && sscanf(argv[++arg], "%d", &threads)) {
+			if (hasArgument && sscanf(argv[++arg], "%ld", &threads)) {
 				if (!threads) {
 					showUsage = true;
 				}
@@ -339,11 +342,11 @@ int main(int argc, char* argv[]) {
 	printf("debug:  %d\n", debug);
 	printf("ccam:   %s\n", ccam);
 	printf("vcam:   %s\n", vcam);
-	printf("width:  %d\n", width);
-	printf("height: %d\n", height);
+	printf("width:  %ld\n", width);
+	printf("height: %ld\n", height);
 	printf("flip_h: %s\n", flipHorizontal ? "yes" : "no");
 	printf("flip_v: %s\n", flipVertical ? "yes" : "no");
-	printf("threads:%d\n", threads);
+	printf("threads:%ld\n", threads);
 	printf("back:   %s\n", back ? back : "(none)");
 	printf("model:  %s\n\n", modelname);
 
