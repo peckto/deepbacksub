@@ -84,7 +84,7 @@ cv::Mat getTensorMat(int tnum, int debug) {
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
 // label number of "person" for DeepLab v3+ model
 const size_t cnum = labels.size();
-const size_t pers = std::distance(std::find(labels.begin(),labels.end(),"person"), labels.begin());
+const size_t pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
 
 // threaded capture shared state
 typedef struct {
